@@ -10,6 +10,7 @@
 # file in the root of the project for the full license.             #
 #                                                                   #
 #####################################################################
+from msilib import sequence
 from labscript_devices import runviewer_parser, labscript_device, BLACS_tab, BLACS_worker
 
 from labscript import Device, IntermediateDevice, Pseudoclock, ClockLine, PseudoclockDevice, config, LabscriptError, StaticAnalogQuantity, AnalogOut, DigitalOut, set_passed_properties, WaitMonitor, compiler, DDS, DDSQuantity
@@ -249,27 +250,19 @@ class ZCU4(PseudoclockDevice):
         flags = [0]*self.n_flags
         dds_enables = [0]*2
         
-        pb_inst.append({'enables':dds_enables,
+        pb_inst.append({'time':0, 'enables':dds_enables,
                         'flags': ''.join([str(flag) for flag in flags]), 'instruction':'STOP',
                         'data': 0, 'delay': 10.0/self.clock_limit*1e9})
-        pb_inst.append({'enables':dds_enables,
+        pb_inst.append({'time': 0, 'enables':dds_enables,
                         'flags': ''.join([str(flag) for flag in flags]),'instruction':'STOP',
                         'data': 0, 'delay': 10.0/self.clock_limit*1e9})
         j += 2
         
         flagstring = '0'*self.n_flags # So that this variable is still defined if the for loop has no iterations
-        wanted_instruction_list = []
+        #wanted_instruction_list = []
+        flag_list = []
         for k, instruction in enumerate(self.pseudoclock.clock):
-            wanted_instruction_list.append(instruction)
-            if instruction == 'WAIT':
-                # This is a wait instruction. Repeat the last instruction but with a 100ns delay and a WAIT op code:
-                wait_instruction = pb_inst[-1].copy()
-                wait_instruction['delay'] = 100
-                wait_instruction['instruction'] = 'WAIT'
-                wait_instruction['data'] = 0
-                pb_inst.append(wait_instruction)
-                j += 1
-                continue
+            #wanted_instruction_list.append(instruction)
                 
             flags = [0]*self.n_flags
             # The registers below are ones, not zeros, so that we don't
@@ -277,7 +270,7 @@ class ZCU4(PseudoclockDevice):
             # unused DDSs have a 'zero' in register one for freq, amp
             # and phase.
             dds_enables = [0]*2
-            
+
             # This flag indicates whether we need a full clock tick, or are just updating an internal output
             only_internal = True
             # find out which clock flags are ticking during this instruction
@@ -294,6 +287,7 @@ class ZCU4(PseudoclockDevice):
             for output in dig_outputs:
                 flagindex = int(output.connection.split()[1])
                 flags[flagindex] = int(output.raw_output[i])
+                #flag_list.append(flags[flagindex])
             for output in dds_outputs:
                 ddsnumber = int(output.connection.split()[1])
                 dds_enables[ddsnumber] = output.gate.raw_output[i]
@@ -319,7 +313,7 @@ class ZCU4(PseudoclockDevice):
                     remaining_low_time += self.long_delay
 
                 # The start loop instruction, Clock edges are high:
-                pb_inst.append({'enables':dds_enables,
+                pb_inst.append({'time': instruction['start'], 'enables':dds_enables,
                                 'flags': flagstring, 'instruction': 'LOOP',
                                 'data': instruction['reps'], 'delay': high_time*1e9})
                 
@@ -332,12 +326,12 @@ class ZCU4(PseudoclockDevice):
             
                 # The long delay instruction, if any. Clock edges are low: 
                 if n_long_delays:
-                    pb_inst.append({'enables':dds_enables,
+                    pb_inst.append({'time': instruction['start'], 'enables':dds_enables,
                                 'flags': flagstring, 'instruction': 'LONG_DELAY',
                                 'data': int(n_long_delays), 'delay': self.long_delay*1e9})
                                 
                 # Remaining low time. Clock edges are low:
-                pb_inst.append({'enables':dds_enables, 
+                pb_inst.append({'time': instruction['start'], 'enables':dds_enables, 
                                 'flags': flagstring, 'instruction': 'END_LOOP',
                                 'data': j, 'delay': remaining_low_time*1e9})
                                 
@@ -359,27 +353,28 @@ class ZCU4(PseudoclockDevice):
                     remaining_delay += self.long_delay
                 
                 if n_long_delays:
-                    pb_inst.append({'enables':dds_enables,
+                    pb_inst.append({'time': instruction['start'], 'enables':dds_enables,
                                 'flags': flagstring, 'instruction': 'LONG_DELAY',
                                 'data': int(n_long_delays), 'delay': self.long_delay*1e9})
 
-                pb_inst.append({'enables':dds_enables,
+                pb_inst.append({'time': instruction['start'], 'enables':dds_enables,
                                 'flags': flagstring, 'instruction': 'CONTINUE',
                                 'data': 0, 'delay': remaining_delay*1e9})
                 
                 j += 2 if n_long_delays else 1
                 
             
-        raise LabscriptError(str(wanted_instruction_list))
+        #raise LabscriptError(str(flag_list))
         return pb_inst
         
     def write_pb_inst_to_h5(self, pb_inst, hdf5_file):
         # OK now we squeeze the instructions into a numpy array ready for writing to hdf5:
-        pb_dtype = [('dds_en0', np.int32),('dds_en1', np.int32), 
+        pb_dtype = [('time', np.float32),('dds_en0', np.int32),('dds_en1', np.int32), 
                     ('flags', np.int32), ('inst', np.int32),
                     ('inst_data', np.int32), ('length', np.float64)]
         pb_inst_table = np.empty(len(pb_inst),dtype = pb_dtype)
         for i,inst in enumerate(pb_inst):
+            timeint = (inst['time'])
             flagint = int(inst['flags'][::-1],2)
             instructionint = self.pb_instructions[inst['instruction']]
             dataint = inst['data']
@@ -387,12 +382,13 @@ class ZCU4(PseudoclockDevice):
             en0 = inst['enables'][0]
             en1 = inst['enables'][1]
             
-            pb_inst_table[i] = (en0,en1, flagint, 
+            pb_inst_table[i] = (timeint, en0,en1, flagint, 
                                 instructionint, dataint, delaydouble)     
-                                
+        #raise LabscriptError(str(pb_inst_table))
         # Okay now write it to the file: 
         group = hdf5_file['/devices/'+self.name]  
         group.create_dataset('PULSE_PROGRAM', compression=config.compression,data = pb_inst_table)   
+        #raise LabscriptError(str(group['PULSE_PROGRAM'][2:][0][3]))
         self.set_property('stop_time', self.stop_time, location='device_properties')
 
 
@@ -444,11 +440,14 @@ from blacs.tab_base_classes import Worker, define_state
 from blacs.tab_base_classes import MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_TRANSITION_TO_MANUAL, MODE_BUFFERED
 
 from blacs.device_base_class import DeviceTab
+from qtutils.qt import QtWidgets
 
 @BLACS_tab
 class ZCU4Tab(DeviceTab):
     def initialise_GUI(self):
         # Capabilities
+                # Create status labels
+
         self.base_units =    {'freq':'MHz',         'amp':'dBm',   'phase':'Degrees', 'length': "ns"}
         self.base_min =      {'freq':0,           'amp':-136.0,  'phase':0, 'length': 0}
         self.base_max =      {'freq':4000.,         'amp':25.0,    'phase':360, 'length':10000}
@@ -496,9 +495,70 @@ class ZCU4Tab(DeviceTab):
         self.create_worker("main_worker", ZCU4Worker, {'com_port':self.com_port})
         self.primary_worker = "main_worker"
 
+        # Create status labels
+        self.status_label = QtWidgets.QLabel("Status: Unknown")
+        self.clock_status_label = QtWidgets.QLabel("Clock status: Unknown")
+        self.get_tab_layout().addWidget(self.status_label)
+        self.get_tab_layout().addWidget(self.clock_status_label)
+
+        # Set the capabilities of this device
+        self.supports_smart_programming(True)
+
+        # Create status monitor timout
+        self.statemachine_timeout_add(2000, self.status_monitor)
         # Set the capabilities of this device
         self.supports_remote_value_check(False) # !!!
         self.supports_smart_programming(False) # !!!
+    @define_state(
+        MODE_MANUAL
+        | MODE_BUFFERED
+        | MODE_TRANSITION_TO_BUFFERED
+        | MODE_TRANSITION_TO_MANUAL,
+        True,
+    )
+    def status_monitor(self, notify_queue=None):
+        """Gets the status of the PrawnBlaster from the worker.
+
+        When called with a queue, this function writes to the queue
+        when the PrawnBlaster is waiting. This indicates the end of
+        an experimental run.
+
+        Args:
+            notify_queue (:class:`~queue.Queue`): Queue to notify when
+                the experiment is done.
+        """
+
+        status, clock_status, waits_pending = yield (
+            self.queue_work(self.primary_worker, "check_status")
+        )
+
+        # Manual mode or aborted
+        done_condition = status == 0 or status == 5
+        done_condition = True
+        # Update GUI status/clock status widgets
+        self.status_label.setText(f"Status: {status}")
+        self.clock_status_label.setText(f"Clock status: {clock_status}")
+
+        if notify_queue is not None and done_condition and not waits_pending:
+            # Experiment is over. Tell the queue manager about it, then
+            # set the status checking timeout back to every 2 seconds
+            # with no queue.
+            notify_queue.put("done")
+            self.statemachine_timeout_remove(self.status_monitor)
+            self.statemachine_timeout_add(2000, self.status_monitor)
+    @define_state(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True)  
+    def start(self,widget=None):
+        yield(self.queue_work(self._primary_worker,'start_run'))
+        self.status_monitor()
+
+    @define_state(MODE_BUFFERED, True)
+    def start_run(self, notify_queue):
+        """When used as the primary Pseudoclock, this starts the run."""
+        self.statemachine_timeout_remove(self.status_monitor)
+        self.status_monitor()
+        self.start()
+        self.statemachine_timeout_add(100, self.status_monitor, notify_queue)
+
 
 @BLACS_worker
 class ZCU4Worker(Worker):
@@ -509,7 +569,8 @@ class ZCU4Worker(Worker):
 
         self.COMPort = self.com_port
         self.baudrate = 115200
-
+        self.sequence_list = []
+        self.pulse_list = [[6, 'const', 0, 100, 30000, 100, 0, 'oneshot', 'product', '[]']]
         self.final_values = {}
 
         self.smart_cache = {'RF_DATA': None,
@@ -544,6 +605,9 @@ class ZCU4Worker(Worker):
         time.sleep(1)
 
         ZCU4ser.close()
+
+    def check_status(self):
+        return 2, 0, False
 
     def check_remote_values(self):
         results = {}
@@ -589,9 +653,10 @@ class ZCU4Worker(Worker):
         sequence_list_string = "sequence_list = " + str(sequence_list) + "\r\n"
         ZCU4ser.write(sequence_list_string.encode())
         time.sleep(1)
-
-        ZCU4ser.write(b"exec(open('send_pulse.py').read())\r\n")
+        loop_number_string = "loop_number = " + str(1) + "\r\n"
+        ZCU4ser.write(loop_number_string.encode())
         time.sleep(1)
+        ZCU4ser.write(b"exec(open('send_pulse.py').read())\r\n")
 
         ZCU4ser.close()
 
@@ -599,97 +664,77 @@ class ZCU4Worker(Worker):
         self.smart_cache['RF_DATA'] = None
 
         return self.check_remote_values()
-        
+
+    def start_run(self):
+        ZCU4ser = serial.Serial(self.COMPort, baudrate=self.baudrate, timeout=1)
+        if(ZCU4ser.isOpen() == False):
+            ZCU4ser.open()
+
+        pulse_list_string = "pulse_list = " + str(self.pulse_list) + "\r\n"
+        ZCU4ser.write(pulse_list_string.encode())
+        time.sleep(1)
+        sequence_list_string = "sequence_list = " + str(self.sequence_list) + "\r\n"
+        ZCU4ser.write(sequence_list_string.encode())
+        time.sleep(1)
+        loop_number_string = "loop_number = " + str(1) + "\r\n"
+        ZCU4ser.write(loop_number_string.encode())
+        time.sleep(1)        
+        ZCU4ser.write(b"exec(open('send_pulse.py').read())\r\n")
+        ZCU4ser.close()
+        #raise LabscriptError(str(sequence_list_string))
+        self.started = True
+
     def transition_to_buffered(self,device_name,h5file,initial_values,fresh):
         self.h5file = h5file
+        self.started = False
+        self.sequence_list = []
 
         with h5py.File(h5file,'r') as hdf5_file:
             group = hdf5_file['devices/%s'%device_name]
-            
-            # Is this shot using the fixed-duration workaround instead of checking the ZCU4's status?
-            self.time_based_stop_workaround = group.attrs.get('time_based_stop_workaround', False)
-            if self.time_based_stop_workaround:
-                self.time_based_shot_duration = (group.attrs['stop_time']
-                                                 + hdf5_file['waits'][:]['timeout'].sum()
-                                                 + group.attrs['time_based_stop_workaround_extra_time'])
-                
-            # Now for the pulse program:
+
             pulse_program = group['PULSE_PROGRAM'][2:]
-            
-            #Let's get the final state of the ZCU4. z's are the args we don't need:
-            en0,en1,flags,z,z,z = pulse_program[-1]
+            #raise LabscriptError(str(pulse_program))
+            for i in range(len(pulse_program)-1):
+                start_time = int((pulse_program[i][0])*(10**9))
+                end_time = int((pulse_program[i+1][0])*(10**9))
+                channels = pulse_program[i][3]
+                for j, k in enumerate(reversed(bin(channels))):
+                    if k == '1':
+                        if start_time != end_time:
+                            self.sequence_list.append((j, start_time, end_time))
+                        elif abs(start_time - end_time) < 1:
+                            self.sequence_list.append((j, start_time, end_time+1000))
+                    elif k == 'b':
+                        break
+            #raise LabscriptError(self.sequence_list)
 
-            
-            # Always call start_programming regardless of whether we are going to do any
-            # programming or not. This is so that is the programming_scheme is 'pb_stop_programming/STOP'
-            # we are ready to be triggered by a call to pb_stop_programming() even if no programming
-            # occurred due to smart programming:
-            wanted_string = ''
-            for i in pulse_program[-1]:
-                wanted_string +=' ' +  str(i)
-            raise LabscriptError("Flags" + wanted_string)            
-            if fresh or (self.smart_cache['initial_values'] != initial_values) or \
-                (len(self.smart_cache['pulse_program']) != len(pulse_program)) or \
-                (self.smart_cache['pulse_program'] != pulse_program).any() or \
-                not self.smart_cache['ready_to_go']:
-            
-                self.smart_cache['ready_to_go'] = True
-                self.smart_cache['initial_values'] = initial_values
+            pulse_list = [[6, 'const', 0, 100, 30000, 100, 0, 'oneshot', 'product', '[]']]
 
-                # create initial flags string
-                # NOTE: The spinapi can take a string or integer for flags.
-                # If it is a string: 
-                #     flag: 0          12
-                #          '101100011111'
-                #
-                # If it is a binary number:
-                #     flag:12          0
-                #         0b111110001101
-                #
-                # Be warned!
-                initial_flags = ''
-                for i in range(12):
-                    if initial_values['flag %d'%i]:
-                        initial_flags += '1'
-                    else:
-                        initial_flags += '0'
+            '''
+            pulse_list_string = "pulse_list = " + str(pulse_list) + "\r\n"
+            ZCU4ser.write(pulse_list_string.encode())
+            time.sleep(1)
+            sequence_list_string = "sequence_list = " + str(self.sequence_list) + "\r\n"
+            #raise LabscriptError(str(sequence_list_string))
 
-                if self.programming_scheme == 'pb_start/BRANCH':
-                    # Line zero is a wait on the final state of the program in 'pb_start/BRANCH' mode 
-                    pb_inst_dds2(freqreg0,phasereg0,ampreg0,en0,0,freqreg1,phasereg1,ampreg1,en1,0,flags,WAIT,0,100)
-                else:
-                    # Line zero otherwise just contains the initial state 
-                    pb_inst_dds2(0,0,0,initial_values['dds 0']['gate'],0,0,0,0,initial_values['dds 1']['gate'],0,initial_flags, CONTINUE, 0, 100)
+            ZCU4ser.write(sequence_list_string.encode())
+            time.sleep(1)
 
-                # Line one is a continue with the current front panel values:
-                pb_inst_dds2(0,0,0,initial_values['dds 0']['gate'],0,0,0,0,initial_values['dds 1']['gate'],0,initial_flags, CONTINUE, 0, 100)
-                # Now the rest of the program:
-                if fresh or len(self.smart_cache['pulse_program']) != len(pulse_program) or \
-                (self.smart_cache['pulse_program'] != pulse_program).any():
-                    self.smart_cache['pulse_program'] = pulse_program
-                    for args in pulse_program:
-                        pb_inst_dds2(*args)
-            
-            # Are there waits in use in this experiment? The monitor waiting for the end
-            # of the experiment will need to know:
-            wait_monitor_exists = bool(hdf5_file['waits'].attrs['wait_monitor_acquisition_device'])
-            waits_in_use = bool(len(hdf5_file['waits']))
-            self.waits_pending = wait_monitor_exists and waits_in_use
-            if waits_in_use and not wait_monitor_exists:
-                # This should be caught during labscript compilation, but just in case.
-                # Having waits but not a wait monitor means we can't tell when the shot
-                # is over unless the shot ends in a STOP instruction:
-                assert self.programming_scheme == 'pb_stop_programming/STOP'
+            ZCU4ser.write(b"exec(open('send_pulse.py').read())\r\n")
+            time.sleep(1)
+            '''
 
-            # Now we build a dictionary of the final state to send back to the GUI:
-            return_values = {'dds 0':{'freq':finalfreq0, 'amp':finalamp0, 'phase':finalphase0, 'gate':en0},
-                             'dds 1':{'freq':finalfreq1, 'amp':finalamp1, 'phase':finalphase1, 'gate':en1},
-                            }
+            return_values = {}
             # Since we are converting from an integer to a binary string, we need to reverse the string! (see notes above when we create flags variables)
-            return_flags = str(bin(flags)[2:]).rjust(12,'0')[::-1]
-            for i in range(12):
-                return_values['flag %d'%i] = return_flags[i]
-                
+            return_channels = pulse_program[-1][3]
+
+            return_flags = reversed(bin(return_channels))
+            for j, k  in enumerate(reversed(bin(return_channels))):
+                if k != 'b':
+                    return_values['flag %d'%i] = k
+                else:
+                    return_values['flag %d' %i] = 0
+            #self.start_run()
             return return_values
             
 
@@ -702,32 +747,11 @@ class ZCU4Worker(Worker):
 
     def transition_to_manual(self,abort = False):
 
-        if abort:
-            # If we're aborting the run, then we need to reset the Static DDSs to their initial values.
-            # We also need to invalidate the smart programming cache.
-            self.smart_cache['RF_DATA'] = None
-            self.smart_cache['SWEEP_DATA'] = None
-        else:
-            # If we're not aborting the run, then we need to set the Static DDSs to their final values.
-            values = self.final_values['channel 0']
-
-        ZCU4 = serial.Serial(self.COMPort, baudrate=self.baudrate, timeout=1)
-        if(ZCU4.isOpen() == False):
-            ZCU4.open()
-        ZCU4.close()
 
         return True
 
-    def start_run(self):
-        if(ZCU4ser.isOpen() == False):
-            ZCU4ser.open()
-        ZCU4ser.write(b"exec(open('send_pulse.py').read())\r\n")
-        ZCU4ser.close()
-
-
     def shutdown(self):
         return
-
 
 import labscript_utils.h5_lock  # noqa: F401
 import h5py
